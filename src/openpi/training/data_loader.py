@@ -138,11 +138,16 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # Allow overriding the video decode backend (e.g. OPENPI_VIDEO_BACKEND=pyav) so
+    # we don't depend on torchcodec's system-FFmpeg version (it needs FFmpeg 4-7;
+    # newer hosts ship FFmpeg 8). pyav bundles its own FFmpeg.
+    video_backend = os.environ.get("OPENPI_VIDEO_BACKEND") or None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=video_backend,
     )
 
     if data_config.prompt_from_task:

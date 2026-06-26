@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.g1_mani_policy as g1_mani_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -459,6 +460,63 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotG1ManiDataConfig(DataConfigFactory):
+    """Data config for the ``g1_mani_only_head_cam_only`` embodiment (16-DOF, head cam only).
+
+    Source dataset is the LEGS "universal" LeRobot dataset built by
+    ``wigs2universal.sh``. We pull:
+      - the head camera from ``image_key`` (newer builds: ``observation.images.ego_view``;
+        older builds: ``observation.images.egocentric``)
+      - the universal joint-space state/action heads ``observation.state_uni_20`` /
+        ``action.uni_23`` (the G1ManiInputs transform then gathers the 16-DOF subset
+        [L_arm(7), L_grip, R_arm(7), R_grip]).
+    The language instruction is loaded from the LeRobot ``task`` field
+    (``prompt_from_task=True``).
+    """
+
+    # LeRobot column holding the head-camera video. Varies by dataset build.
+    image_key: str = "observation.images.ego_view"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack only remaps key names: dataset column -> the key our transform expects.
+        # The 16-DOF gather happens inside G1ManiInputs (repack cannot slice).
+        # NOTE: the action column ``action.uni_23`` is chunked by the LeRobot data
+        # loader (see action_sequence_keys below), so we reference it directly.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": self.image_key,
+                        "observation/state": "observation.state_uni_20",
+                        "actions": "action.uni_23",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Arm joints + grippers are absolute targets, so we do NOT apply a delta
+        # transform (mirrors the DROID-velocity config which also skips deltas).
+        data_transforms = _transforms.Group(
+            inputs=[g1_mani_policy.G1ManiInputs(model_type=model_config.model_type)],
+            outputs=[g1_mani_policy.G1ManiOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # The LeRobot action column is ``action.uni_23`` (not the default "actions");
+            # the loader chunks this key to length action_horizon.
+            action_sequence_keys=("action.uni_23",),
         )
 
 
@@ -915,6 +973,86 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        # Low-memory (LoRA) fine-tuning of pi05-DROID on a custom (smaller) DROID dataset.
+        # Same data path as pi05_droid_finetune, but uses LoRA variants of the gemma backbone
+        # and action expert so it fits on a single ~24GB+ GPU (LoRA finetune needs >22.5GB).
+        name="pi05_droid_lora_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 is trained with 32-dim actions
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            # Replace with your custom DROID LeRobot dataset repo id.
+            repo_id="your_hf_username/my_droid_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Important: reuse the original DROID norm stats during fine-tuning!
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        # Freeze the base (non-LoRA) gemma + action-expert params; only LoRA adapters train.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    #
+    # G1 manipulation-only (head-cam-only, 16-DOF) configs.
+    #
+   
+    TrainConfig(
+        # Full-scale LoRA fine-tuning of pi05-DROID on the 500-episode left-arm
+        # pick dataset (0625_pick_up_left_500_uni), g1_mani_only_head_cam_only
+        # 16-DOF embodiment. Runs on 4 GPUs (DDP), batch_size=64 (16/GPU), 20k steps.
+        name="pi05_g1_mani_lora_bottle500",
+        project_name="openpi_legs",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # keep 32 to match the pi05-DROID checkpoint projections
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotG1ManiDataConfig(
+            repo_id="0625_pick_up_left_500_uni",
+            # This build uses the newer head-cam column name "ego_view".
+            image_key="observation.images.ego_view",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # Start from the generic pi05_base (not pi05_droid, which is specialized to
+        # the DROID Franka). Base is the right init for a fresh G1 embodiment.
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,  # 16 per GPU x 4 GPUs
+        # LoRA pi05 fits comfortably on one L40S (46GB), so we use plain data
+        # parallelism (fsdp_devices=1: full model replica per GPU, batch split
+        # 16/GPU) instead of FSDP — avoids the all-gather comms overhead.
+        fsdp_devices=1,
+        # More dataloader workers to keep the GPUs fed (video decode is the bottleneck).
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
